@@ -280,6 +280,163 @@ class DailyImprovementLoopTests(unittest.TestCase):
 
         self.assertFalse([p for p in proposals if p["route"] == "skill_improvement"])
 
+    def test_correction_after_multiple_skills_is_not_attributed(self):
+        summary = loop.SessionSummary(
+            source="claude", path=Path("x"), session_id="s8", cwd="/tmp/project"
+        )
+        correction = loop.Evidence(
+            source="claude",
+            path="x",
+            line=30,
+            kind="user_correction",
+            excerpt="Actually, preserve the approved layout.",
+            session_id="s8",
+        )
+        summary.corrections.append(correction)
+        summary.user_message_lines.extend([1, 30])
+        for line, skill in ((10, "design-skill"), (20, "voice-skill")):
+            summary.skill_invocations[skill] = [
+                loop.Evidence(
+                    source="claude",
+                    path="x",
+                    line=line,
+                    kind="skill_invocation",
+                    excerpt=f"Skill({skill})",
+                    session_id="s8",
+                )
+            ]
+
+        proposals = loop.generate_proposals([summary])
+
+        self.assertFalse([p for p in proposals if p["route"] == "skill_improvement"])
+        self.assertFalse([p for p in proposals if p["route"] == "memory_context"])
+
+    def test_skill_correction_only_uses_skill_from_preceding_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "user",
+                        "sessionId": "turns",
+                        "message": {"role": "user", "content": "Start the task."},
+                    },
+                    {
+                        "type": "assistant",
+                        "sessionId": "turns",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "skill-old",
+                                    "name": "Skill",
+                                    "input": {"skill": "old-skill"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "turns",
+                        "message": {"role": "user", "content": "Continue."},
+                    },
+                    {
+                        "type": "assistant",
+                        "sessionId": "turns",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "skill-current",
+                                    "name": "Skill",
+                                    "input": {"skill": "current-skill"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "turns",
+                        "message": {
+                            "role": "user",
+                            "content": "Actually, preserve the approved layout.",
+                        },
+                    },
+                ],
+            )
+
+            proposals = loop.generate_proposals([loop.parse_claude_session(path)])
+
+        skills = {
+            proposal["target"]["name"]
+            for proposal in proposals
+            if proposal["route"] == "skill_improvement"
+        }
+        self.assertEqual(skills, {"current-skill"})
+
+    def test_compound_failure_without_localization_does_not_blame_cli(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "assistant",
+                        "sessionId": "compound",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "compound-call",
+                                    "name": "Bash",
+                                    "input": {
+                                        "command": "records-cli list --json; diff expected actual"
+                                    },
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "sessionId": "compound",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "compound-call",
+                                    "is_error": True,
+                                    "content": "Exit code: 1\nFiles expected and actual differ",
+                                }
+                            ],
+                        },
+                    },
+                ],
+            )
+
+            summary = loop.parse_claude_session(path)
+
+        self.assertEqual(len(summary.failures), 1)
+        cli_evidence = summary.tracked_cli_invocations["records-cli"]
+        self.assertEqual({item.kind for item in cli_evidence}, {"tracked_cli_invocation"})
+
+    def test_compound_failure_can_be_localized_to_cli(self):
+        command = "records-cli list --json; diff expected actual"
+
+        self.assertEqual(
+            loop.tracked_cli_failures_for_output(
+                command,
+                "records-cli: Error: unauthorized\nExit code: 1",
+                ["records-cli"],
+                confirmed_failure=True,
+            ),
+            ["records-cli"],
+        )
+
     def test_text_only_tracked_cli_failure_language_is_not_hard_failure(self):
         # Regression case based on rejected ads-tool doctor probes.
         # triage batch: diagnostic output is not a failed tool result.
@@ -937,7 +1094,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
             self.assertEqual(len(tool_props), 1)
             self.assertIn("hang/timeout", tool_props[0]["summary"])
 
-    def test_tracked_cli_syntax_guessing_is_flagged_without_failure(self):
+    def test_flag_variation_without_failure_is_not_friction(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude.jsonl"
             rows = []
@@ -968,8 +1125,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
             self.assertFalse(summary.failures)
             proposals = loop.generate_proposals([summary])
             tool_props = [p for p in proposals if p["target"]["name"] == "media-cli"]
-            self.assertEqual(len(tool_props), 1)
-            self.assertIn("retried up to 3x", tool_props[0]["summary"])
+            self.assertEqual(tool_props, [])
 
     def test_repeated_normal_cli_use_is_not_retry_friction(self):
         summary = loop.SessionSummary(source="claude", path=Path("normal.jsonl"), session_id="r2")
@@ -990,7 +1146,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
 
         self.assertFalse([p for p in proposals if p["target"]["name"] == "records-cli"])
 
-    def test_repeated_cli_use_with_same_session_hang_is_retry_friction(self):
+    def test_repeated_cli_use_with_same_session_hang_reports_only_the_hang(self):
         summary = loop.SessionSummary(source="claude", path=Path("hang.jsonl"), session_id="r3")
         invocations = [
             loop.Evidence(
@@ -1019,7 +1175,7 @@ class DailyImprovementLoopTests(unittest.TestCase):
         proposal = next(p for p in proposals if p["target"]["name"] == "notes-cli")
 
         self.assertIn("hang/timeout", proposal["summary"])
-        self.assertIn("retried up to 3x", proposal["summary"])
+        self.assertNotIn("retried", proposal["summary"])
 
     def test_distinct_tracked_cli_subcommands_are_not_counted_as_retries(self):
         summary = loop.SessionSummary(source="claude", path=Path("x"), session_id="r2")

@@ -195,10 +195,6 @@ SILENT_EMPTY_IGNORE_EXECUTABLES = {
     "touch",
 }
 DETECT_SILENT_EMPTY = True
-# A tracked CLI invoked at least this many times in a single session can be
-# retry-before-success friction when corroborated by failure/hang evidence or
-# same-subcommand flag variation.
-RETRY_STUCK_THRESHOLD = 3
 BACKLOG_IGNORE_EXECUTABLES = {
     "",
     "-v",
@@ -359,6 +355,7 @@ class SessionSummary:
     tool_calls: List[ToolCall] = field(default_factory=list)
     tracked_cli_invocations: Dict[str, List[Evidence]] = field(default_factory=dict)
     skill_invocations: Dict[str, List[Evidence]] = field(default_factory=dict)
+    user_message_lines: List[int] = field(default_factory=list)
     failures: List[Evidence] = field(default_factory=list)
     silent_empty: List[Evidence] = field(default_factory=list)
     corrections: List[Evidence] = field(default_factory=list)
@@ -756,7 +753,10 @@ def capture_tracked_cli_hang(
     # comes back with a hard error phrase is real evidence, not documentation.
     if INSPECTION_COMMAND_RE.search(command) and not TRACKED_CLI_STRONG_FRICTION_RE.search(output):
         return
-    for cli in (clis if clis is not None else tracked_cli_names(command)):
+    tracked_names = clis if clis is not None else tracked_cli_names(command)
+    for cli in tracked_cli_failures_for_output(
+        command, output, tracked_names, confirmed_failure=True
+    ):
         add_tracked_cli_evidence(
             summary,
             cli,
@@ -835,55 +835,6 @@ def tracked_cli_names_from_code(text: str) -> List[str]:
         if TRACKED_CLI_SUFFIX in literal:
             names.update(_tracked_cli_names(literal, depth=1))
     return sorted(names)
-
-
-def tracked_cli_argv_shapes(command: str, cli: str) -> List[Tuple[str, Tuple[str, ...]]]:
-    """Return (subcommand, flags) shapes for a tracked CLI invocation.
-
-    Shape comparison deliberately ignores positional values. Retry evidence is
-    meant to catch syntax guessing (the same subcommand tried with different
-    flags), not repeated reads of different records.
-    """
-    candidates = [command]
-    if CODE_COMMAND_RE.match(command or ""):
-        candidates = [
-            match.group(2).replace(r"\n", "\n").replace(r"\t", "\t")
-            for match in CODE_SHELL_STRING_RE.finditer(command)
-            if cli in match.group(2)
-        ]
-
-    shapes: List[Tuple[str, Tuple[str, ...]]] = []
-    for candidate in candidates:
-        tokens = shell_tokens(candidate)
-        for index, token in enumerate(tokens):
-            if Path(token.strip()).name.strip() != cli:
-                continue
-            argv: List[str] = []
-            for arg in tokens[index + 1 :]:
-                if arg in SHELL_SEPARATORS:
-                    break
-                argv.append(arg)
-            subcommand_parts: List[str] = []
-            for arg in argv:
-                if arg.startswith("-"):
-                    break
-                subcommand_parts.append(arg)
-            subcommand = " ".join(subcommand_parts)
-            flags = tuple(
-                sorted({arg.split("=", 1)[0] for arg in argv if arg.startswith("-")})
-            )
-            shapes.append((subcommand, flags))
-    return shapes
-
-
-def has_retry_shape_variation(invocations: List[Evidence], cli: str) -> bool:
-    """True when one subcommand was tried with more than one flag shape."""
-    by_subcommand: Dict[str, set[Tuple[str, ...]]] = {}
-    for item in invocations:
-        for subcommand, flags in tracked_cli_argv_shapes(item.command, cli):
-            if subcommand:
-                by_subcommand.setdefault(subcommand, set()).add(flags)
-    return any(len(flag_shapes) > 1 for flag_shapes in by_subcommand.values())
 
 
 def _tracked_cli_names(command: str, depth: int) -> set[str]:
@@ -1149,9 +1100,6 @@ def tracked_cli_failures_for_output(
     clis = tracked_cli_names(command) if clis is None else clis
     if not clis or (not confirmed_failure and not is_failure_text(output, command, clis)):
         return []
-    if len(clis) == 1:
-        return list(clis)
-
     lines = output.splitlines()
     localized = set()
     for index, line in enumerate(lines):
@@ -1161,7 +1109,21 @@ def tracked_cli_failures_for_output(
             window = "\n".join(lines[max(0, index - 1) : index + 3])
             if BAD_EXIT_RE.search(window) or TRACKED_CLI_FRICTION_RE.search(window):
                 localized.add(cli)
-    return sorted(localized)
+    if localized:
+        return sorted(localized)
+
+    candidates = [command]
+    if CODE_COMMAND_RE.match(command or ""):
+        candidates = [
+            match.group(2).replace(r"\n", "\n").replace(r"\t", "\t")
+            for match in CODE_SHELL_STRING_RE.finditer(command)
+            if any(cli in match.group(2) for cli in clis)
+        ]
+    if len(clis) == 1 and len(candidates) == 1:
+        tokens = shell_tokens(strip_heredoc_bodies(candidates[0]))
+        if not any(token in SHELL_SEPARATORS for token in tokens):
+            return list(clis)
+    return []
 
 
 def parse_claude_session(path: Path) -> SessionSummary:
@@ -1215,6 +1177,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         )
                     )
                 if not is_transcript_scaffold(text, path):
+                    summary.user_message_lines.append(line_no)
                     seen_user_texts.add(normalize_user_text(text))
 
         if isinstance(content, list):
@@ -1301,7 +1264,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                                 call.clis,
                                 confirmed_failure=True,
                             )
-                            for cli in clis or call.clis:
+                            for cli in clis:
                                 add_tracked_cli_evidence(summary, cli, ev)
                     elif call and result_text and call.name == "Bash":
                         capture_tracked_cli_hang(
@@ -1432,6 +1395,7 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     )
                 )
             if not is_transcript_scaffold(text, path):
+                summary.user_message_lines.append(line_no)
                 seen_user_texts.add(normalize_user_text(text))
 
         payload_type = payload.get("type")
@@ -1583,6 +1547,7 @@ def parse_hermes_messages(
                     )
                 )
             if not is_transcript_scaffold(content, path):
+                summary.user_message_lines.append(line_no)
                 seen_user_texts.add(normalize_user_text(content))
 
         if tool_calls_raw:
@@ -1859,7 +1824,6 @@ def generate_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
     tracked_failures: Dict[str, List[Evidence]] = {}
     tracked_hangs: Dict[str, List[Evidence]] = {}
     tracked_silent_empty: Dict[str, List[Evidence]] = {}
-    tracked_max_retries: Dict[str, int] = {}
     for session in sessions:
         include_session_silent_empty = (
             INCLUDE_SUBAGENT_FAILURES or "/subagents/" not in str(session.path)
@@ -1878,40 +1842,12 @@ def generate_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
                 elif item.kind == "silent_empty" and include_session_silent_empty:
                     tracked_silent_empty.setdefault(cli, []).append(item)
 
-            # Retry-before-success is per CLI and session. Repetition alone is
-            # normal use; qualify it only when the same session has failure/hang
-            # evidence or one subcommand is tried with differing flag shapes.
-            by_session: Dict[str, List[Evidence]] = {}
-            signal_sessions = {
-                item.session_id
-                for item in items
-                if item.kind in {"tool_failure", "tracked_cli_hang"}
-                or (item.kind == "silent_empty" and include_session_silent_empty)
-            }
-            for item in invocations:
-                by_session.setdefault(item.session_id, []).append(item)
-            for session_id, session_invocations in by_session.items():
-                count = len(session_invocations)
-                if count < RETRY_STUCK_THRESHOLD:
-                    continue
-                if session_id in signal_sessions or has_retry_shape_variation(
-                    session_invocations, cli
-                ):
-                    tracked_max_retries[cli] = max(
-                        tracked_max_retries.get(cli, 0), count
-                    )
-
     flagged_clis = sorted(
         cli
         for cli in (
             set(tracked_failures)
             | set(tracked_hangs)
             | set(tracked_silent_empty)
-            | {
-                cli
-                for cli, count in tracked_max_retries.items()
-                if count >= RETRY_STUCK_THRESHOLD
-            }
         )
         if VALID_TRACKED_CLI_RE.match(cli)
     )
@@ -1920,8 +1856,6 @@ def generate_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
         hangs = tracked_hangs.get(cli, [])
         silent_empty = tracked_silent_empty.get(cli, [])
         invocations = tracked_invocations.get(cli, [])
-        max_retries = tracked_max_retries.get(cli, 0)
-        stuck = max_retries >= RETRY_STUCK_THRESHOLD
         evidence_items = (failures + hangs + silent_empty + invocations)[:12]
         session_count = len({ev.session_id for ev in evidence_items})
 
@@ -1932,8 +1866,6 @@ def generate_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
             friction_bits.append(f"{len(hangs)} hang/timeout signal(s)")
         if silent_empty:
             friction_bits.append(f"{len(silent_empty)} swallowed empty result(s)")
-        if stuck:
-            friction_bits.append(f"retried up to {max_retries}x in one session before it worked")
         summary = f"{cli}: " + ", ".join(friction_bits) + f" across {session_count} session(s)."
 
         action = (
@@ -1957,18 +1889,31 @@ def generate_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
 
     skill_corrections: Dict[str, List[Evidence]] = {}
     skill_sessions: Dict[str, set[str]] = {}
+    attributed_corrections: set[Tuple[str, int]] = set()
+    ambiguous_corrections: set[Tuple[str, int]] = set()
     for session in sessions:
-        if not session.corrections:
-            continue
-        for skill, skill_evidence in session.skill_invocations.items():
-            first_skill_line = min(ev.line for ev in skill_evidence)
-            relevant_corrections = [
-                ev for ev in session.corrections if ev.line > first_skill_line
-            ]
-            if not relevant_corrections:
-                continue
-            skill_corrections.setdefault(skill, []).extend(skill_evidence + relevant_corrections)
-            skill_sessions.setdefault(skill, set()).add(session.session_id)
+        for correction in session.corrections:
+            turn_start = max(
+                (line for line in session.user_message_lines if line < correction.line),
+                default=0,
+            )
+            candidates = {
+                skill: [
+                    ev
+                    for ev in evidence_items
+                    if turn_start < ev.line < correction.line
+                ]
+                for skill, evidence_items in session.skill_invocations.items()
+            }
+            candidates = {skill: items for skill, items in candidates.items() if items}
+            key = (correction.path, correction.line)
+            if len(candidates) == 1:
+                skill, skill_evidence = next(iter(candidates.items()))
+                skill_corrections.setdefault(skill, []).extend(skill_evidence + [correction])
+                skill_sessions.setdefault(skill, set()).add(session.session_id)
+                attributed_corrections.add(key)
+            elif len(candidates) > 1:
+                ambiguous_corrections.add(key)
     for skill, evidence_items in sorted(skill_corrections.items()):
         proposals.append(
             make_proposal(
@@ -1995,9 +1940,14 @@ def generate_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
     # would have prevented this", and one busy session cannot flood the packet.
     corrections_by_project: Dict[str, List[Evidence]] = {}
     for session in sessions:
-        if session.corrections and not session.skill_invocations:
+        project_corrections = [
+            ev
+            for ev in session.corrections
+            if (ev.path, ev.line) not in attributed_corrections | ambiguous_corrections
+        ]
+        if project_corrections:
             corrections_by_project.setdefault(session.cwd or "unknown-project", []).extend(
-                session.corrections[:MAX_CORRECTIONS_PER_SESSION]
+                project_corrections[:MAX_CORRECTIONS_PER_SESSION]
             )
     for project, items in sorted(corrections_by_project.items()):
         label = Path(project).name if project != "unknown-project" else project

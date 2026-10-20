@@ -28,9 +28,9 @@ Every transcript reduces to tool calls, CLI invocations, skill invocations, fail
 
 ## Routing
 
-- `tool`: real tracked-CLI use produced a failure/hang/retry/silent-empty signal, or an MCP server accumulated recurring failure/silent-empty evidence (grouped per server as `mcp:<server>`). Fix the CLI or server contract.
-- `skill_improvement`: a skill was invoked and the same session later contains a correction. Prefer patching the existing skill.
-- `memory_context`: corrections not tied to a skill, grouped per project (`cwd`) and capped per session, so one busy session cannot flood the packet. Promote only durable preferences or runbook facts.
+- `tool`: real tracked-CLI use produced a failure, hang, or silent-empty signal, or an MCP server accumulated recurring failure/silent-empty evidence (grouped per server as `mcp:<server>`). Fix the CLI or server contract.
+- `skill_improvement`: exactly one skill was invoked in the assistant turn immediately before a correction. Multiple-skill turns are left unattributed instead of blaming every skill. Prefer patching the existing skill.
+- `memory_context`: corrections not tied to one skill in the immediately preceding turn, grouped per project (`cwd`) and capped per session, so one busy session cannot flood the packet. Promote only durable preferences or runbook facts.
 - `backlog`: repeated general-tool failures across sessions, plus recurring attributable silent-empty results from general data-fetch commands. Subagent transcripts are excluded by default (exploratory subagents fail by design), and ambiguous code-runtime inputs are skipped because there is no single shell executable to blame. Decide durable vs transient before creating a task.
 
 Proposal IDs are deterministic from route, target, and evidence references, so daily scans avoid restaging the same item unless `--include-seen` is passed.
