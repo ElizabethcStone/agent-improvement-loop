@@ -979,7 +979,7 @@ def command_intends_data(call: ToolCall, command: str) -> bool:
     tokens = shell_tokens(command)
     if not tokens:
         return False
-    if any(token in {";", "&&", "||"} for token in tokens):
+    if any(token in SHELL_SEPARATORS for token in tokens):
         return False
     executable = first_executable(command)
     if executable in SILENT_EMPTY_IGNORE_EXECUTABLES:
@@ -2139,22 +2139,18 @@ def backlog_executable(command: str) -> str:
         # Code-shaped input (current Codex exec calls carry JavaScript): there
         # is no shell executable to blame, so it cannot feed the backlog route.
         return ""
-    candidates = re.split(r"\s*(?:&&|\|\||;|\||\n)\s*", command)
-    fallback = ""
-    for candidate in candidates:
-        executable = first_executable(candidate)
-        if not executable:
-            continue
-        if not fallback:
-            fallback = executable
-        if executable.startswith("-") or executable.startswith("<"):
-            continue
-        if executable in BACKLOG_IGNORE_EXECUTABLES:
-            continue
-        return executable
-    if fallback in BACKLOG_IGNORE_EXECUTABLES or fallback.startswith("-") or fallback.startswith("<"):
+    # shortcut: combined output cannot identify the failed segment; upgrade
+    # when transcripts expose per-command exit status.
+    if any(token in SHELL_SEPARATORS for token in shell_tokens(strip_heredoc_bodies(command))):
         return ""
-    return fallback
+    executable = first_executable(command)
+    if (
+        executable in BACKLOG_IGNORE_EXECUTABLES
+        or executable.startswith("-")
+        or executable.startswith("<")
+    ):
+        return ""
+    return executable
 
 
 def dedupe_proposals(proposals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

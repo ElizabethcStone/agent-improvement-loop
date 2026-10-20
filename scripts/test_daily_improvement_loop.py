@@ -1768,12 +1768,17 @@ class ProposalNoiseTests(unittest.TestCase):
         self.assertEqual(summary.silent_empty, [])
 
     def test_compound_fetch_command_is_too_ambiguous_to_flag(self):
-        summary = self._parse_claude_empty_result(
+        for command in (
             "widgetctl records --json && git status --short",
-            output="[]",
-            path_name="compound-empty.jsonl",
-        )
-        self.assertEqual(summary.silent_empty, [])
+            "bd list --json | jq '.[] | select(.status == \"open\")'",
+        ):
+            with self.subTest(command=command):
+                summary = self._parse_claude_empty_result(
+                    command,
+                    output="[]",
+                    path_name="compound-empty.jsonl",
+                )
+                self.assertEqual(summary.silent_empty, [])
 
     def test_subagent_silent_empty_is_not_flagged_by_default(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2605,6 +2610,17 @@ class ResolutionTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertEqual(loop.backlog_executable(command), "")
+
+    def test_backlog_executable_rejects_ambiguous_compound_commands(self):
+        for command in (
+            "sed -n '1p' missing && python3 build.py",
+            "bd update task --claim; ssh host deploy",
+            "python3 render.py; ls missing.png",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(loop.backlog_executable(command), "")
+        self.assertEqual(loop.backlog_executable("python3 build.py"), "python3")
+        self.assertEqual(loop.backlog_executable("bd ready"), "bd")
 
     def test_collect_fleet_bundles_uses_latest_redacted_bundle_per_machine(self):
         with tempfile.TemporaryDirectory() as td:
